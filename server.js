@@ -1,19 +1,94 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
 const pool = require('./db');
-const authMiddleware = require('./auth');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 const app = express();
-app.use(cors());
+
+const allowedOrigins = [
+  'https://app.gevox.com.br',
+  'https://admin.gevox.com.br',
+  'https://gevox.com.br',
+  'http://localhost:3000',
+  'http://localhost:5173'
+];
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Origem não permitida pelo CORS'));
+  }
+}));
+
 app.use(express.json());
 
-// --- PUBLICAS ---
+function generateToken(user) {
+  return jwt.sign(
+    {
+      id: String(user.id),
+      email: user.email,
+      perfil: user.perfil,
+      tenant_id: String(user.tenant_id)
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: '8h' }
+  );
+}
+
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    return res.status(401).json({ error: 'Token nao fornecido' });
+  }
+
+  const parts = authHeader.split(' ');
+
+  if (parts.length !== 2) {
+    return res.status(401).json({ error: 'Token mal formatado' });
+  }
+
+  const [scheme, token] = parts;
+
+  if (!/^Bearer$/i.test(scheme)) {
+    return res.status(401).json({ error: 'Token mal formatado' });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(401).json({ error: 'Token invalido' });
+    }
+
+    req.user = decoded;
+    next();
+  });
+}
+
+function requirePerfil(...perfisPermitidos) {
+  return (req, res, next) => {
+    if (!req.user || !perfisPermitidos.includes(req.user.perfil)) {
+      return res.status(403).json({ error: 'Acesso negado' });
+    }
+    next();
+  };
+}
+
+function getTenantFilter(req, tableAlias = '') {
+  const prefix = tableAlias ? `${tableAlias}.` : '';
+  if (req.user.perfil === 'superadmin') {
+    return { clause: '', params: [] };
+  }
+  return {
+    clause: `WHERE ${prefix}tenant_id = $1`,
+    params: [req.user.tenant_id]
+  };
+}
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'Gevox API' });
+  res.json({ ok: true, service: 'Gevox API', version: 'v1' });
 });
 
 app.get('/health', async (req, res) => {
@@ -26,141 +101,187 @@ app.get('/health', async (req, res) => {
 });
 
 app.post('/auth/login', async (req, res) => {
-  const { email, senha } = req.body;
-  if (!email || !senha) return res.status(400).json({ error: 'Email e senha obrigatorios' });
   try {
-    const result = await pool.query('SELECT * FROM users WHERE email = $1 AND ativo = true LIMIT 1', [email]);
-    if (result.rows.length === 0) return res.status(401).json({ error: 'Credenciais invalidas' });
-    const user = result.rows[0];
-    const senhaValida = await bcrypt.compare(senha, user.senha_hash);
-    if (!senhaValida) return res.status(401).json({ error: 'Credenciais invalidas' });
-    const token = jwt.sign(
-      { id: user.id, email: user.email, perfil: user.perfil, tenant_id: user.tenant_id },
-      process.env.JWT_SECRET,
-      { expiresIn: '8h' }
+    const { email, senha } = req.body;
+
+    if (!email || !senha) {
+      return res.status(400).json({ error: 'Email e senha são obrigatórios' });
+    }
+
+    const result = await pool.query(
+      `SELECT id, email, senha_hash, perfil, tenant_id, ativo, nome
+       FROM users
+       WHERE email = $1
+       LIMIT 1`,
+      [email]
     );
-    res.json({ token, perfil: user.perfil, nome: user.nome });
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Credenciais invalidas' });
+    }
+
+    const user = result.rows[0];
+
+    if (!user.ativo) {
+      return res.status(403).json({ error: 'Usuario inativo' });
+    }
+
+    const senhaValida = await bcrypt.compare(senha, user.senha_hash);
+
+    if (!senhaValida) {
+      return res.status(401).json({ error: 'Credenciais invalidas' });
+    }
+
+    const token = generateToken(user);
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        nome: user.nome,
+        email: user.email,
+        perfil: user.perfil,
+        tenant_id: user.tenant_id
+      }
+    });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: 'Erro interno no login', detail: error.message });
   }
 });
-
-// --- PROTEGIDAS ---
 
 app.get('/auth/me', authMiddleware, (req, res) => {
   res.json({ user: req.user });
 });
 
-// TENANTS
+app.get('/api/v1/tenants', authMiddleware, async (req, res) => {
+  try {
+    const filtro = getTenantFilter(req);
+    const query = `
+      SELECT *
+      FROM tenants
+      ${filtro.clause}
+      ORDER BY id ASC
+    `;
+    const result = await pool.query(query, filtro.params);
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/v1/products', authMiddleware, async (req, res) => {
+  try {
+    const filtro = getTenantFilter(req);
+    const query = `
+      SELECT *
+      FROM products
+      ${filtro.clause}
+      ORDER BY id ASC
+    `;
+    const result = await pool.query(query, filtro.params);
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/v1/customers', authMiddleware, async (req, res) => {
+  try {
+    const filtro = getTenantFilter(req);
+    const query = `
+      SELECT *
+      FROM customers
+      ${filtro.clause}
+      ORDER BY id ASC
+    `;
+    const result = await pool.query(query, filtro.params);
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/v1/users', authMiddleware, requirePerfil('superadmin', 'admin'), async (req, res) => {
+  try {
+    const filtro = getTenantFilter(req);
+    const query = `
+      SELECT id, nome, email, perfil, tenant_id, ativo, created_at
+      FROM users
+      ${filtro.clause}
+      ORDER BY id ASC
+    `;
+    const result = await pool.query(query, filtro.params);
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/v1/dashboard/summary', authMiddleware, async (req, res) => {
+  try {
+    const filtroProducts = getTenantFilter(req);
+    const filtroCustomers = getTenantFilter(req);
+    const filtroUsers = getTenantFilter(req);
+
+    const [products, customers, users] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS total FROM products ${filtroProducts.clause}`, filtroProducts.params),
+      pool.query(`SELECT COUNT(*)::int AS total FROM customers ${filtroCustomers.clause}`, filtroCustomers.params),
+      pool.query(`SELECT COUNT(*)::int AS total FROM users ${filtroUsers.clause}`, filtroUsers.params)
+    ]);
+
+    res.json({
+      products: products.rows[0].total,
+      customers: customers.rows[0].total,
+      users: users.rows[0].total
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/tenants', authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM tenants ORDER BY id ASC');
+    const filtro = getTenantFilter(req);
+    const query = `
+      SELECT *
+      FROM tenants
+      ${filtro.clause}
+      ORDER BY id ASC
+    `;
+    const result = await pool.query(query, filtro.params);
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get('/tenants/:id', authMiddleware, async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM tenants WHERE id = $1', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Tenant nao encontrado' });
-    res.json(result.rows[0]);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// PRODUCTS
 app.get('/products', authMiddleware, async (req, res) => {
   try {
-    const { tenant_id } = req.user;
-    const result = await pool.query('SELECT * FROM products WHERE tenant_id = $1 ORDER BY id ASC', [tenant_id]);
+    const filtro = getTenantFilter(req);
+    const query = `
+      SELECT *
+      FROM products
+      ${filtro.clause}
+      ORDER BY id ASC
+    `;
+    const result = await pool.query(query, filtro.params);
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.post('/products', authMiddleware, async (req, res) => {
-  const { codigo, nome, descricao, categoria, unidade, preco_compra, preco_venda, estoque_atual, estoque_minimo } = req.body;
-  const { tenant_id } = req.user;
-  try {
-    const result = await pool.query(
-      'INSERT INTO products (tenant_id, tipo_item, codigo, nome, descricao, categoria, unidade, preco_compra, preco_venda, estoque_atual, estoque_minimo) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
-      [tenant_id, 'produto', codigo, nome, descricao, categoria, unidade, preco_compra, preco_venda, estoque_atual || 0, estoque_minimo || 0]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.put('/products/:id', authMiddleware, async (req, res) => {
-  const { nome, descricao, categoria, preco_venda, estoque_atual, ativo } = req.body;
-  const { tenant_id } = req.user;
-  try {
-    const result = await pool.query(
-      'UPDATE products SET nome=$1, descricao=$2, categoria=$3, preco_venda=$4, estoque_atual=$5, ativo=$6 WHERE id=$7 AND tenant_id=$8 RETURNING *',
-      [nome, descricao, categoria, preco_venda, estoque_atual, ativo, req.params.id, tenant_id]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Produto nao encontrado' });
-    res.json(result.rows[0]);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// CUSTOMERS
 app.get('/customers', authMiddleware, async (req, res) => {
   try {
-    const { tenant_id } = req.user;
-    const result = await pool.query('SELECT * FROM customers WHERE tenant_id = $1 ORDER BY id ASC', [tenant_id]);
+    const filtro = getTenantFilter(req);
+    const query = `
+      SELECT *
+      FROM customers
+      ${filtro.clause}
+      ORDER BY id ASC
+    `;
+    const result = await pool.query(query, filtro.params);
     res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/customers', authMiddleware, async (req, res) => {
-  const { nome, telefone, email, endereco, observacoes } = req.body;
-  const { tenant_id } = req.user;
-  try {
-    const result = await pool.query(
-      'INSERT INTO customers (tenant_id, nome, telefone, email, endereco, observacoes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-      [tenant_id, nome, telefone, email, endereco, observacoes]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// USERS
-app.get('/users', authMiddleware, async (req, res) => {
-  try {
-    const { tenant_id } = req.user;
-    const result = await pool.query('SELECT id, nome, email, perfil, ativo, created_at FROM users WHERE tenant_id = $1 ORDER BY id ASC', [tenant_id]);
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// DASHBOARD
-app.get('/dashboard/summary', authMiddleware, async (req, res) => {
-  const { tenant_id } = req.user;
-  try {
-    const [products, customers, sales] = await Promise.all([
-      pool.query('SELECT COUNT(*) FROM products WHERE tenant_id=$1 AND ativo=true', [tenant_id]),
-      pool.query('SELECT COUNT(*) FROM customers WHERE tenant_id=$1 AND ativo=true', [tenant_id]),
-      pool.query('SELECT COUNT(*) FROM sales_orders WHERE tenant_id=$1', [tenant_id]),
-    ]);
-    res.json({
-      total_products: products.rows[0].count,
-      total_customers: customers.rows[0].count,
-      total_sales: sales.rows[0].count,
-    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
