@@ -287,6 +287,173 @@ app.get('/customers', authMiddleware, async (req, res) => {
   }
 });
 
+
+// ========== CRUD - TENANTS ==========
+app.post('/api/v1/tenants', authMiddleware, requirePerfil('superadmin'), async (req, res) => {
+  try {
+    const { nome, plano, ativo } = req.body;
+    const result = await pool.query(
+      'INSERT INTO tenants (nome, plano, ativo) VALUES ($1, $2, $3) RETURNING *',
+      [nome, plano || 'basico', ativo !== false]
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { nome, plano, ativo } = req.body;
+    const result = await pool.query(
+      'UPDATE tenants SET nome=$1, plano=$2, ativo=$3 WHERE id=$4 RETURNING *',
+      [nome, plano, ativo, id]
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM tenants WHERE id=$1', [id]);
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========== CRUD - PRODUCTS ==========
+app.post('/api/v1/products', authMiddleware, async (req, res) => {
+  try {
+    const filtro = getTenantFilter(req);
+    const { nome, preco, estoque } = req.body;
+    const result = await pool.query(
+      'INSERT INTO products (nome, preco, estoque, tenant_id) VALUES ($1, $2, $3, $4) RETURNING *',
+      [nome, preco || 0, estoque || 0, filtro.params[0]]
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/v1/products/:id', authMiddleware, async (req, res) => {
+  try {
+    const filtro = getTenantFilter(req);
+    const { id } = req.params;
+    const { nome, preco, estoque } = req.body;
+    const result = await pool.query(
+      'UPDATE products SET nome=$1, preco=$2, estoque=$3 WHERE id=$4 ${filtro.clause} RETURNING *',
+      [nome, preco, estoque, id, ...filtro.params]
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/v1/products/:id', authMiddleware, async (req, res) => {
+  try {
+    const filtro = getTenantFilter(req);
+    const { id } = req.params;
+    await pool.query('DELETE FROM products WHERE id=$1 ${filtro.clause}', [id, ...filtro.params]);
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========== CRUD - CUSTOMERS ==========
+app.post('/api/v1/customers', authMiddleware, async (req, res) => {
+  try {
+    const filtro = getTenantFilter(req);
+    const { nome, email, telefone } = req.body;
+    const result = await pool.query(
+      'INSERT INTO customers (nome, email, telefone, tenant_id) VALUES ($1, $2, $3, $4) RETURNING *',
+      [nome, email || null, telefone || null, filtro.params[0]]
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/v1/customers/:id', authMiddleware, async (req, res) => {
+  try {
+    const filtro = getTenantFilter(req);
+    const { id } = req.params;
+    const { nome, email, telefone } = req.body;
+    const result = await pool.query(
+      'UPDATE customers SET nome=$1, email=$2, telefone=$3 WHERE id=$4 ${filtro.clause} RETURNING *',
+      [nome, email, telefone, id, ...filtro.params]
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/v1/customers/:id', authMiddleware, async (req, res) => {
+  try {
+    const filtro = getTenantFilter(req);
+    const { id } = req.params;
+    await pool.query('DELETE FROM customers WHERE id=$1 ${filtro.clause}', [id, ...filtro.params]);
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========== CRUD - USERS ==========
+app.post('/api/v1/users', authMiddleware, requirePerfil('superadmin', 'admin'), async (req, res) => {
+  try {
+    const { nome, email, senha, perfil, tenant_id, ativo } = req.body;
+    const senha_hash = await bcrypt.hash(senha, 10);
+    const result = await pool.query(
+      'INSERT INTO users (nome, email, senha_hash, perfil, tenant_id, ativo) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, nome, email, perfil, tenant_id, ativo',
+      [nome, email, senha_hash, perfil || 'user', tenant_id, ativo !== false]
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/v1/users/:id', authMiddleware, requirePerfil('superadmin', 'admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { nome, email, senha, perfil, ativo } = req.body;
+    let query = 'UPDATE users SET nome=$1, email=$2, perfil=$3, ativo=$4';
+    const params = [nome, email, perfil, ativo];
+    if (senha) {
+      const senha_hash = await bcrypt.hash(senha, 10);
+      query += ', senha_hash=$5 WHERE id=$6 RETURNING id, nome, email, perfil, tenant_id, ativo';
+      params.push(senha_hash, id);
+    } else {
+      query += ' WHERE id=$5 RETURNING id, nome, email, perfil, tenant_id, ativo';
+      params.push(id);
+    }
+    const result = await pool.query(query, params);
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/v1/users/:id', authMiddleware, requirePerfil('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM users WHERE id=$1', [id]);
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 const port = process.env.PORT || process.env.APP_PORT || 3000;
 app.listen(port, () => {
   console.log(`Gevox API running on port ${port}`);
