@@ -157,7 +157,7 @@ app.get('/api/v1/tenants', authMiddleware, async (req, res) => {
   try {
     const filtro = getTenantFilter(req);
     const query = `
-      SELECT *
+      SELECT id, nome_fantasia AS nome, razao_social AS slug, ativo
       FROM tenants
       ${filtro.clause}
       ORDER BY id ASC
