@@ -287,15 +287,41 @@ app.get('/customers', authMiddleware, async (req, res) => {
   }
 });
 
-
 // ========== CRUD - TENANTS ==========
 app.post('/api/v1/tenants', authMiddleware, requirePerfil('superadmin'), async (req, res) => {
   try {
-    const { nome, plano, ativo } = req.body;
+    const {
+      nome_fantasia,
+      razao_social,
+      cnpj,
+      email,
+      telefone,
+      plano,
+      status_assinatura
+    } = req.body;
+
     const result = await pool.query(
-      'INSERT INTO tenants (nome, plano, ativo) VALUES ($1, $2, $3) RETURNING *',
-      [nome, plano || 'basico', ativo !== false]
+      `INSERT INTO tenants (
+        nome_fantasia,
+        razao_social,
+        cnpj,
+        email,
+        telefone,
+        plano,
+        status_assinatura
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING *`,
+      [
+        nome_fantasia,
+        razao_social,
+        cnpj || null,
+        email || null,
+        telefone || null,
+        plano || 'basico',
+        status_assinatura || 'ativa'
+      ]
     );
+
     res.json(result.rows[0]);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -305,11 +331,44 @@ app.post('/api/v1/tenants', authMiddleware, requirePerfil('superadmin'), async (
 app.put('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin'), async (req, res) => {
   try {
     const { id } = req.params;
-    const { nome, plano, ativo } = req.body;
+    const {
+      nome_fantasia,
+      razao_social,
+      cnpj,
+      email,
+      telefone,
+      plano,
+      status_assinatura
+    } = req.body;
+
     const result = await pool.query(
-      'UPDATE tenants SET nome=$1, plano=$2, ativo=$3 WHERE id=$4 RETURNING *',
-      [nome, plano, ativo, id]
+      `UPDATE tenants
+       SET
+         nome_fantasia = $1,
+         razao_social = $2,
+         cnpj = $3,
+         email = $4,
+         telefone = $5,
+         plano = $6,
+         status_assinatura = $7
+       WHERE id = $8
+       RETURNING *`,
+      [
+        nome_fantasia,
+        razao_social,
+        cnpj || null,
+        email || null,
+        telefone || null,
+        plano || 'basico',
+        status_assinatura || 'ativa',
+        id
+      ]
     );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Tenant nao encontrado' });
+    }
+
     res.json(result.rows[0]);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -319,8 +378,16 @@ app.put('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin'), asyn
 app.delete('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin'), async (req, res) => {
   try {
     const { id } = req.params;
-    await pool.query('DELETE FROM tenants WHERE id=$1', [id]);
-    res.json({ ok: true });
+    const result = await pool.query(
+      'DELETE FROM tenants WHERE id = $1 RETURNING *',
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Tenant nao encontrado' });
+    }
+
+    res.json({ ok: true, deleted: result.rows[0] });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -330,11 +397,17 @@ app.delete('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin'), a
 app.post('/api/v1/products', authMiddleware, async (req, res) => {
   try {
     const filtro = getTenantFilter(req);
+    const tenantId = req.user.perfil === 'superadmin'
+      ? (req.body.tenant_id || null)
+      : req.user.tenant_id;
+
     const { nome, preco, estoque } = req.body;
+
     const result = await pool.query(
       'INSERT INTO products (nome, preco, estoque, tenant_id) VALUES ($1, $2, $3, $4) RETURNING *',
-      [nome, preco || 0, estoque || 0, filtro.params[0]]
+      [nome, preco || 0, estoque || 0, tenantId]
     );
+
     res.json(result.rows[0]);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -346,10 +419,27 @@ app.put('/api/v1/products/:id', authMiddleware, async (req, res) => {
     const filtro = getTenantFilter(req);
     const { id } = req.params;
     const { nome, preco, estoque } = req.body;
-    const result = await pool.query(
-      'UPDATE products SET nome=$1, preco=$2, estoque=$3 WHERE id=$4 ${filtro.clause} RETURNING *',
-      [nome, preco, estoque, id, ...filtro.params]
-    );
+
+    let query = `
+      UPDATE products
+      SET nome = $1, preco = $2, estoque = $3
+      WHERE id = $4
+    `;
+    let params = [nome, preco, estoque, id];
+
+    if (filtro.clause) {
+      query += ' AND tenant_id = $5';
+      params.push(req.user.tenant_id);
+    }
+
+    query += ' RETURNING *';
+
+    const result = await pool.query(query, params);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Produto nao encontrado' });
+    }
+
     res.json(result.rows[0]);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -360,8 +450,24 @@ app.delete('/api/v1/products/:id', authMiddleware, async (req, res) => {
   try {
     const filtro = getTenantFilter(req);
     const { id } = req.params;
-    await pool.query('DELETE FROM products WHERE id=$1 ${filtro.clause}', [id, ...filtro.params]);
-    res.json({ ok: true });
+
+    let query = 'DELETE FROM products WHERE id = $1';
+    let params = [id];
+
+    if (filtro.clause) {
+      query += ' AND tenant_id = $2';
+      params.push(req.user.tenant_id);
+    }
+
+    query += ' RETURNING *';
+
+    const result = await pool.query(query, params);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Produto nao encontrado' });
+    }
+
+    res.json({ ok: true, deleted: result.rows[0] });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -370,12 +476,17 @@ app.delete('/api/v1/products/:id', authMiddleware, async (req, res) => {
 // ========== CRUD - CUSTOMERS ==========
 app.post('/api/v1/customers', authMiddleware, async (req, res) => {
   try {
-    const filtro = getTenantFilter(req);
+    const tenantId = req.user.perfil === 'superadmin'
+      ? (req.body.tenant_id || null)
+      : req.user.tenant_id;
+
     const { nome, email, telefone } = req.body;
+
     const result = await pool.query(
       'INSERT INTO customers (nome, email, telefone, tenant_id) VALUES ($1, $2, $3, $4) RETURNING *',
-      [nome, email || null, telefone || null, filtro.params[0]]
+      [nome, email || null, telefone || null, tenantId]
     );
+
     res.json(result.rows[0]);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -387,10 +498,27 @@ app.put('/api/v1/customers/:id', authMiddleware, async (req, res) => {
     const filtro = getTenantFilter(req);
     const { id } = req.params;
     const { nome, email, telefone } = req.body;
-    const result = await pool.query(
-      'UPDATE customers SET nome=$1, email=$2, telefone=$3 WHERE id=$4 ${filtro.clause} RETURNING *',
-      [nome, email, telefone, id, ...filtro.params]
-    );
+
+    let query = `
+      UPDATE customers
+      SET nome = $1, email = $2, telefone = $3
+      WHERE id = $4
+    `;
+    let params = [nome, email, telefone, id];
+
+    if (filtro.clause) {
+      query += ' AND tenant_id = $5';
+      params.push(req.user.tenant_id);
+    }
+
+    query += ' RETURNING *';
+
+    const result = await pool.query(query, params);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Cliente nao encontrado' });
+    }
+
     res.json(result.rows[0]);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -401,8 +529,24 @@ app.delete('/api/v1/customers/:id', authMiddleware, async (req, res) => {
   try {
     const filtro = getTenantFilter(req);
     const { id } = req.params;
-    await pool.query('DELETE FROM customers WHERE id=$1 ${filtro.clause}', [id, ...filtro.params]);
-    res.json({ ok: true });
+
+    let query = 'DELETE FROM customers WHERE id = $1';
+    let params = [id];
+
+    if (filtro.clause) {
+      query += ' AND tenant_id = $2';
+      params.push(req.user.tenant_id);
+    }
+
+    query += ' RETURNING *';
+
+    const result = await pool.query(query, params);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Cliente nao encontrado' });
+    }
+
+    res.json({ ok: true, deleted: result.rows[0] });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -413,10 +557,12 @@ app.post('/api/v1/users', authMiddleware, requirePerfil('superadmin', 'admin'), 
   try {
     const { nome, email, senha, perfil, tenant_id, ativo } = req.body;
     const senha_hash = await bcrypt.hash(senha, 10);
+
     const result = await pool.query(
       'INSERT INTO users (nome, email, senha_hash, perfil, tenant_id, ativo) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, nome, email, perfil, tenant_id, ativo',
       [nome, email, senha_hash, perfil || 'user', tenant_id, ativo !== false]
     );
+
     res.json(result.rows[0]);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -427,8 +573,10 @@ app.put('/api/v1/users/:id', authMiddleware, requirePerfil('superadmin', 'admin'
   try {
     const { id } = req.params;
     const { nome, email, senha, perfil, ativo } = req.body;
+
     let query = 'UPDATE users SET nome=$1, email=$2, perfil=$3, ativo=$4';
     const params = [nome, email, perfil, ativo];
+
     if (senha) {
       const senha_hash = await bcrypt.hash(senha, 10);
       query += ', senha_hash=$5 WHERE id=$6 RETURNING id, nome, email, perfil, tenant_id, ativo';
@@ -437,7 +585,13 @@ app.put('/api/v1/users/:id', authMiddleware, requirePerfil('superadmin', 'admin'
       query += ' WHERE id=$5 RETURNING id, nome, email, perfil, tenant_id, ativo';
       params.push(id);
     }
+
     const result = await pool.query(query, params);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario nao encontrado' });
+    }
+
     res.json(result.rows[0]);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -447,8 +601,17 @@ app.put('/api/v1/users/:id', authMiddleware, requirePerfil('superadmin', 'admin'
 app.delete('/api/v1/users/:id', authMiddleware, requirePerfil('superadmin'), async (req, res) => {
   try {
     const { id } = req.params;
-    await pool.query('DELETE FROM users WHERE id=$1', [id]);
-    res.json({ ok: true });
+
+    const result = await pool.query(
+      'DELETE FROM users WHERE id=$1 RETURNING id, nome, email, perfil, tenant_id, ativo',
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario nao encontrado' });
+    }
+
+    res.json({ ok: true, deleted: result.rows[0] });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
