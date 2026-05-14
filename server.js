@@ -6,6 +6,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const app = express();
+app.disable('x-powered-by');
 
 const allowedOrigins = [
   'https://app.gevox.com.br',
@@ -23,7 +24,48 @@ app.use(cors({
   }
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+
+const isProduction = process.env.NODE_ENV === 'production';
+
+function logError(error) {
+  console.error(error);
+}
+
+function internalError(res, error) {
+  logError(error);
+  return res.status(500).json({
+    error: isProduction ? 'Erro interno do servidor' : error.message
+  });
+}
+
+function normalizeEmail(email) {
+  return String(email || '').trim().toLowerCase();
+}
+
+function normalizeSlug(slug) {
+  return String(slug || '').trim().toLowerCase();
+}
+
+function onlyDigits(value) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || '').trim());
+}
+
+function isValidSlug(slug) {
+  return /^[a-z0-9-]+$/.test(String(slug || '').trim());
+}
+
+function isValidPerfil(perfil) {
+  return ['superadmin', 'admin', 'user'].includes(perfil);
+}
+
+function isPositiveOrZeroNumber(value) {
+  return !Number.isNaN(Number(value)) && Number(value) >= 0;
+}
 
 function generateToken(user) {
   return jwt.sign(
@@ -87,6 +129,144 @@ function getTenantFilter(req, tableAlias = '') {
   };
 }
 
+function canManageTenantId(req, tenantId) {
+  if (req.user.perfil === 'superadmin') return true;
+  return String(req.user.tenant_id) === String(tenantId);
+}
+
+function getRequestIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) {
+    return String(forwarded).split(',')[0].trim();
+  }
+  return req.ip || req.connection?.remoteAddress || 'unknown';
+}
+
+// Rate limit simples para login
+const loginAttempts = new Map();
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = 5;
+
+function checkLoginRateLimit(req, res, next) {
+  const ip = getRequestIp(req);
+  const now = Date.now();
+  const current = loginAttempts.get(ip);
+
+  if (!current || now > current.expiresAt) {
+    loginAttempts.set(ip, {
+      count: 1,
+      expiresAt: now + LOGIN_WINDOW_MS
+    });
+    return next();
+  }
+
+  if (current.count >= LOGIN_MAX_ATTEMPTS) {
+    return res.status(429).json({
+      error: 'Muitas tentativas de login. Tente novamente em alguns minutos'
+    });
+  }
+
+  current.count += 1;
+  next();
+}
+
+function clearLoginRateLimit(req) {
+  const ip = getRequestIp(req);
+  loginAttempts.delete(ip);
+}
+
+function validateTenantInput(body) {
+  const planosPermitidos = ['basico', 'pro', 'premium'];
+  const statusPermitidos = ['ativado', 'desativado', 'pendente'];
+
+  if (!body.nome_fantasia || !String(body.nome_fantasia).trim()) {
+    return 'Nome da empresa é obrigatório';
+  }
+
+  if (!body.slug || !String(body.slug).trim()) {
+    return 'Slug é obrigatório';
+  }
+
+  if (!isValidSlug(body.slug)) {
+    return 'Slug inválido. Use apenas letras minúsculas, números e hífen';
+  }
+
+  if (body.plano && !planosPermitidos.includes(body.plano)) {
+    return 'Plano inválido';
+  }
+
+  if (body.status_assinatura && !statusPermitidos.includes(body.status_assinatura)) {
+    return 'Status da assinatura inválido';
+  }
+
+  if (body.email && !isValidEmail(body.email)) {
+    return 'Email inválido';
+  }
+
+  if (body.total_credito !== undefined && !isPositiveOrZeroNumber(body.total_credito)) {
+    return 'Crédito total inválido';
+  }
+
+  const cpfCnpj = onlyDigits(body.cpf_cnpj);
+  if (body.cpf_cnpj && ![11, 14].includes(cpfCnpj.length)) {
+    return 'CPF ou CNPJ inválido';
+  }
+
+  return null;
+}
+
+function validateProductInput(body) {
+  if (!body.nome || !String(body.nome).trim()) {
+    return 'Nome do produto é obrigatório';
+  }
+
+  if (body.preco !== undefined && Number.isNaN(Number(body.preco))) {
+    return 'Preço inválido';
+  }
+
+  if (body.estoque !== undefined && Number.isNaN(Number(body.estoque))) {
+    return 'Estoque inválido';
+  }
+
+  return null;
+}
+
+function validateCustomerInput(body) {
+  if (!body.nome || !String(body.nome).trim()) {
+    return 'Nome do cliente é obrigatório';
+  }
+
+  if (body.email && !isValidEmail(body.email)) {
+    return 'Email inválido';
+  }
+
+  return null;
+}
+
+function validateUserInput(body, { isUpdate = false } = {}) {
+  if (!body.nome || !String(body.nome).trim()) {
+    return 'Nome do usuário é obrigatório';
+  }
+
+  if (!body.email || !isValidEmail(body.email)) {
+    return 'Email inválido';
+  }
+
+  if (!isUpdate && (!body.senha || String(body.senha).length < 6)) {
+    return 'Senha deve ter pelo menos 6 caracteres';
+  }
+
+  if (isUpdate && body.senha && String(body.senha).length < 6) {
+    return 'Senha deve ter pelo menos 6 caracteres';
+  }
+
+  if (body.perfil && !isValidPerfil(body.perfil)) {
+    return 'Perfil inválido';
+  }
+
+  return null;
+}
+
 app.get('/', (req, res) => {
   res.json({ ok: true, service: 'Gevox API', version: 'v1' });
 });
@@ -96,13 +276,15 @@ app.get('/health', async (req, res) => {
     const result = await pool.query('SELECT NOW()');
     res.json({ ok: true, db: true, now: result.rows[0].now });
   } catch (error) {
-    res.status(500).json({ ok: false, db: false, error: error.message });
+    logError(error);
+    res.status(500).json({ ok: false, db: false, error: 'Erro interno do servidor' });
   }
 });
 
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/login', checkLoginRateLimit, async (req, res) => {
   try {
-    const { email, senha } = req.body;
+    const email = normalizeEmail(req.body.email);
+    const senha = String(req.body.senha || '');
 
     if (!email || !senha) {
       return res.status(400).json({ error: 'Email e senha são obrigatórios' });
@@ -132,6 +314,8 @@ app.post('/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Credenciais invalidas' });
     }
 
+    clearLoginRateLimit(req);
+
     const token = generateToken(user);
 
     res.json({
@@ -145,7 +329,7 @@ app.post('/auth/login', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ error: 'Erro interno no login', detail: error.message });
+    return internalError(res, error);
   }
 });
 
@@ -178,7 +362,7 @@ app.get('/api/v1/tenants', authMiddleware, async (req, res) => {
     const result = await pool.query(query, filtro.params);
     res.json(result.rows);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
@@ -194,7 +378,7 @@ app.get('/api/v1/products', authMiddleware, async (req, res) => {
     const result = await pool.query(query, filtro.params);
     res.json(result.rows);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
@@ -210,7 +394,7 @@ app.get('/api/v1/customers', authMiddleware, async (req, res) => {
     const result = await pool.query(query, filtro.params);
     res.json(result.rows);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
@@ -226,7 +410,7 @@ app.get('/api/v1/users', authMiddleware, requirePerfil('superadmin', 'admin'), a
     const result = await pool.query(query, filtro.params);
     res.json(result.rows);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
@@ -263,7 +447,7 @@ app.get('/api/v1/dashboard/summary', authMiddleware, async (req, res) => {
       total_credito: Number(credits.rows[0].total || 0)
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
@@ -279,7 +463,7 @@ app.get('/tenants', authMiddleware, async (req, res) => {
     const result = await pool.query(query, filtro.params);
     res.json(result.rows);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
@@ -295,7 +479,7 @@ app.get('/products', authMiddleware, async (req, res) => {
     const result = await pool.query(query, filtro.params);
     res.json(result.rows);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
@@ -311,25 +495,37 @@ app.get('/customers', authMiddleware, async (req, res) => {
     const result = await pool.query(query, filtro.params);
     res.json(result.rows);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
 // ========== CRUD - TENANTS ==========
 app.post('/api/v1/tenants', authMiddleware, requirePerfil('superadmin', 'admin'), async (req, res) => {
   try {
-    const {
-      nome_fantasia,
-      razao_social,
-      cpf_cnpj,
-      whatsapp_principal,
-      email,
-      plano,
-      status_assinatura,
-      total_credito,
-      ativo,
-      slug
-    } = req.body;
+    const validationError = validateTenantInput(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
+    const nome_fantasia = String(req.body.nome_fantasia).trim();
+    const razao_social = String(req.body.razao_social || nome_fantasia).trim();
+    const cpf_cnpj = req.body.cpf_cnpj ? onlyDigits(req.body.cpf_cnpj) : null;
+    const whatsapp_principal = req.body.whatsapp_principal ? String(req.body.whatsapp_principal).trim() : null;
+    const email = req.body.email ? normalizeEmail(req.body.email) : null;
+    const plano = req.body.plano || 'basico';
+    const status_assinatura = req.body.status_assinatura || 'ativado';
+    const total_credito = Number(req.body.total_credito || 0);
+    const ativo = req.body.ativo !== false;
+    const slug = normalizeSlug(req.body.slug);
+
+    const slugCheck = await pool.query(
+      'SELECT id FROM tenants WHERE slug = $1 LIMIT 1',
+      [slug]
+    );
+
+    if (slugCheck.rows.length > 0) {
+      return res.status(409).json({ error: 'Já existe uma empresa com este slug' });
+    }
 
     const result = await pool.query(
       `INSERT INTO tenants (
@@ -347,39 +543,67 @@ app.post('/api/v1/tenants', authMiddleware, requirePerfil('superadmin', 'admin')
       RETURNING *`,
       [
         nome_fantasia,
-        razao_social || nome_fantasia,
-        cpf_cnpj || null,
-        whatsapp_principal || null,
-        email || null,
-        plano || 'basico',
-        status_assinatura || 'ativado',
-        Number(total_credito || 0),
-        ativo !== false,
+        razao_social,
+        cpf_cnpj,
+        whatsapp_principal,
+        email,
+        plano,
+        status_assinatura,
+        total_credito,
+        ativo,
         slug
       ]
     );
 
     res.json(result.rows[0]);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
 app.put('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin', 'admin'), async (req, res) => {
   try {
     const { id } = req.params;
-    const {
-      nome_fantasia,
-      razao_social,
-      cpf_cnpj,
-      whatsapp_principal,
-      email,
-      plano,
-      status_assinatura,
-      total_credito,
-      ativo,
-      slug
-    } = req.body;
+    const validationError = validateTenantInput(req.body);
+
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
+    if (req.user.perfil !== 'superadmin') {
+      const tenantCheck = await pool.query(
+        'SELECT id, tenant_id FROM tenants WHERE id = $1 LIMIT 1',
+        [id]
+      );
+
+      if (tenantCheck.rows.length === 0) {
+        return res.status(404).json({ error: 'Tenant nao encontrado' });
+      }
+
+      if (!canManageTenantId(req, tenantCheck.rows[0].id)) {
+        return res.status(403).json({ error: 'Acesso negado para este tenant' });
+      }
+    }
+
+    const nome_fantasia = String(req.body.nome_fantasia).trim();
+    const razao_social = String(req.body.razao_social || nome_fantasia).trim();
+    const cpf_cnpj = req.body.cpf_cnpj ? onlyDigits(req.body.cpf_cnpj) : null;
+    const whatsapp_principal = req.body.whatsapp_principal ? String(req.body.whatsapp_principal).trim() : null;
+    const email = req.body.email ? normalizeEmail(req.body.email) : null;
+    const plano = req.body.plano || 'basico';
+    const status_assinatura = req.body.status_assinatura || 'ativado';
+    const total_credito = Number(req.body.total_credito || 0);
+    const ativo = req.body.ativo !== false;
+    const slug = normalizeSlug(req.body.slug);
+
+    const slugCheck = await pool.query(
+      'SELECT id FROM tenants WHERE slug = $1 AND id <> $2 LIMIT 1',
+      [slug, id]
+    );
+
+    if (slugCheck.rows.length > 0) {
+      return res.status(409).json({ error: 'Já existe uma empresa com este slug' });
+    }
 
     const result = await pool.query(
       `UPDATE tenants
@@ -398,14 +622,14 @@ app.put('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin', 'admi
        RETURNING *`,
       [
         nome_fantasia,
-        razao_social || nome_fantasia,
-        cpf_cnpj || null,
-        whatsapp_principal || null,
-        email || null,
-        plano || 'basico',
-        status_assinatura || 'ativado',
-        Number(total_credito || 0),
-        ativo !== false,
+        razao_social,
+        cpf_cnpj,
+        whatsapp_principal,
+        email,
+        plano,
+        status_assinatura,
+        total_credito,
+        ativo,
         slug,
         id
       ]
@@ -417,13 +641,18 @@ app.put('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin', 'admi
 
     res.json(result.rows[0]);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
 app.delete('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin', 'admin'), async (req, res) => {
   try {
     const { id } = req.params;
+
+    if (req.user.perfil !== 'superadmin' && String(req.user.tenant_id) !== String(id)) {
+      return res.status(403).json({ error: 'Acesso negado para este tenant' });
+    }
+
     const result = await pool.query(
       'DELETE FROM tenants WHERE id = $1 RETURNING *',
       [id]
@@ -435,35 +664,53 @@ app.delete('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin', 'a
 
     res.json({ ok: true, deleted: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
 // ========== CRUD - PRODUCTS ==========
 app.post('/api/v1/products', authMiddleware, async (req, res) => {
   try {
+    const validationError = validateProductInput(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
     const tenantId = req.user.perfil === 'superadmin'
       ? (req.body.tenant_id || null)
       : req.user.tenant_id;
 
-    const { nome, preco, estoque } = req.body;
+    if (!tenantId) {
+      return res.status(400).json({ error: 'tenant_id é obrigatório' });
+    }
+
+    const nome = String(req.body.nome).trim();
+    const preco = Number(req.body.preco || 0);
+    const estoque = Number(req.body.estoque || 0);
 
     const result = await pool.query(
       'INSERT INTO products (nome, preco, estoque, tenant_id) VALUES ($1, $2, $3, $4) RETURNING *',
-      [nome, preco || 0, estoque || 0, tenantId]
+      [nome, preco, estoque, tenantId]
     );
 
     res.json(result.rows[0]);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
 app.put('/api/v1/products/:id', authMiddleware, async (req, res) => {
   try {
+    const validationError = validateProductInput(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
     const filtro = getTenantFilter(req);
     const { id } = req.params;
-    const { nome, preco, estoque } = req.body;
+    const nome = String(req.body.nome).trim();
+    const preco = Number(req.body.preco || 0);
+    const estoque = Number(req.body.estoque || 0);
 
     let query = `
       UPDATE products
@@ -487,7 +734,7 @@ app.put('/api/v1/products/:id', authMiddleware, async (req, res) => {
 
     res.json(result.rows[0]);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
@@ -514,35 +761,53 @@ app.delete('/api/v1/products/:id', authMiddleware, async (req, res) => {
 
     res.json({ ok: true, deleted: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
 // ========== CRUD - CUSTOMERS ==========
 app.post('/api/v1/customers', authMiddleware, async (req, res) => {
   try {
+    const validationError = validateCustomerInput(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
     const tenantId = req.user.perfil === 'superadmin'
       ? (req.body.tenant_id || null)
       : req.user.tenant_id;
 
-    const { nome, email, telefone } = req.body;
+    if (!tenantId) {
+      return res.status(400).json({ error: 'tenant_id é obrigatório' });
+    }
+
+    const nome = String(req.body.nome).trim();
+    const email = req.body.email ? normalizeEmail(req.body.email) : null;
+    const telefone = req.body.telefone ? String(req.body.telefone).trim() : null;
 
     const result = await pool.query(
       'INSERT INTO customers (nome, email, telefone, tenant_id) VALUES ($1, $2, $3, $4) RETURNING *',
-      [nome, email || null, telefone || null, tenantId]
+      [nome, email, telefone, tenantId]
     );
 
     res.json(result.rows[0]);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
 app.put('/api/v1/customers/:id', authMiddleware, async (req, res) => {
   try {
+    const validationError = validateCustomerInput(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
     const filtro = getTenantFilter(req);
     const { id } = req.params;
-    const { nome, email, telefone } = req.body;
+    const nome = String(req.body.nome).trim();
+    const email = req.body.email ? normalizeEmail(req.body.email) : null;
+    const telefone = req.body.telefone ? String(req.body.telefone).trim() : null;
 
     let query = `
       UPDATE customers
@@ -566,7 +831,7 @@ app.put('/api/v1/customers/:id', authMiddleware, async (req, res) => {
 
     res.json(result.rows[0]);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
@@ -593,37 +858,111 @@ app.delete('/api/v1/customers/:id', authMiddleware, async (req, res) => {
 
     res.json({ ok: true, deleted: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
 // ========== CRUD - USERS ==========
 app.post('/api/v1/users', authMiddleware, requirePerfil('superadmin', 'admin'), async (req, res) => {
   try {
-    const { nome, email, senha, perfil, tenant_id, ativo } = req.body;
+    const validationError = validateUserInput(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
+    const nome = String(req.body.nome).trim();
+    const email = normalizeEmail(req.body.email);
+    const senha = String(req.body.senha);
+    const perfil = req.body.perfil || 'user';
+    const ativo = req.body.ativo !== false;
+
+    let tenant_id = req.body.tenant_id;
+
+    if (req.user.perfil !== 'superadmin') {
+      tenant_id = req.user.tenant_id;
+      if (perfil === 'superadmin') {
+        return res.status(403).json({ error: 'Acesso negado para criar superadmin' });
+      }
+    }
+
+    if (!tenant_id) {
+      return res.status(400).json({ error: 'tenant_id é obrigatório' });
+    }
+
+    if (!canManageTenantId(req, tenant_id)) {
+      return res.status(403).json({ error: 'Acesso negado para este tenant' });
+    }
+
+    const emailCheck = await pool.query(
+      'SELECT id FROM users WHERE email = $1 LIMIT 1',
+      [email]
+    );
+
+    if (emailCheck.rows.length > 0) {
+      return res.status(409).json({ error: 'Já existe um usuário com este email' });
+    }
+
     const senha_hash = await bcrypt.hash(senha, 10);
 
     const result = await pool.query(
-      'INSERT INTO users (nome, email, senha_hash, perfil, tenant_id, ativo) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, nome, email, perfil, tenant_id, ativo',
-      [nome, email, senha_hash, perfil || 'user', tenant_id, ativo !== false]
+      `INSERT INTO users (nome, email, senha_hash, perfil, tenant_id, ativo)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, nome, email, perfil, tenant_id, ativo`,
+      [nome, email, senha_hash, perfil, tenant_id, ativo]
     );
 
     res.json(result.rows[0]);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
 app.put('/api/v1/users/:id', authMiddleware, requirePerfil('superadmin', 'admin'), async (req, res) => {
   try {
+    const validationError = validateUserInput(req.body, { isUpdate: true });
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
     const { id } = req.params;
-    const { nome, email, senha, perfil, ativo } = req.body;
+    const nome = String(req.body.nome).trim();
+    const email = normalizeEmail(req.body.email);
+    const perfil = req.body.perfil || 'user';
+    const ativo = req.body.ativo !== false;
+
+    const userCheck = await pool.query(
+      'SELECT id, tenant_id, perfil FROM users WHERE id = $1 LIMIT 1',
+      [id]
+    );
+
+    if (userCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario nao encontrado' });
+    }
+
+    const targetUser = userCheck.rows[0];
+
+    if (!canManageTenantId(req, targetUser.tenant_id)) {
+      return res.status(403).json({ error: 'Acesso negado para este tenant' });
+    }
+
+    if (req.user.perfil !== 'superadmin' && perfil === 'superadmin') {
+      return res.status(403).json({ error: 'Acesso negado para definir superadmin' });
+    }
+
+    const emailCheck = await pool.query(
+      'SELECT id FROM users WHERE email = $1 AND id <> $2 LIMIT 1',
+      [email, id]
+    );
+
+    if (emailCheck.rows.length > 0) {
+      return res.status(409).json({ error: 'Já existe um usuário com este email' });
+    }
 
     let query = 'UPDATE users SET nome=$1, email=$2, perfil=$3, ativo=$4';
     const params = [nome, email, perfil, ativo];
 
-    if (senha) {
-      const senha_hash = await bcrypt.hash(senha, 10);
+    if (req.body.senha) {
+      const senha_hash = await bcrypt.hash(String(req.body.senha), 10);
       query += ', senha_hash=$5 WHERE id=$6 RETURNING id, nome, email, perfil, tenant_id, ativo';
       params.push(senha_hash, id);
     } else {
@@ -639,13 +978,32 @@ app.put('/api/v1/users/:id', authMiddleware, requirePerfil('superadmin', 'admin'
 
     res.json(result.rows[0]);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
 });
 
 app.delete('/api/v1/users/:id', authMiddleware, requirePerfil('superadmin', 'admin'), async (req, res) => {
   try {
     const { id } = req.params;
+
+    const userCheck = await pool.query(
+      'SELECT id, tenant_id, perfil FROM users WHERE id = $1 LIMIT 1',
+      [id]
+    );
+
+    if (userCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario nao encontrado' });
+    }
+
+    const targetUser = userCheck.rows[0];
+
+    if (!canManageTenantId(req, targetUser.tenant_id)) {
+      return res.status(403).json({ error: 'Acesso negado para este tenant' });
+    }
+
+    if (req.user.perfil !== 'superadmin' && targetUser.perfil === 'superadmin') {
+      return res.status(403).json({ error: 'Acesso negado para excluir superadmin' });
+    }
 
     const result = await pool.query(
       'DELETE FROM users WHERE id=$1 RETURNING id, nome, email, perfil, tenant_id, ativo',
@@ -658,8 +1016,16 @@ app.delete('/api/v1/users/:id', authMiddleware, requirePerfil('superadmin', 'adm
 
     res.json({ ok: true, deleted: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return internalError(res, error);
   }
+});
+
+// Tratamento de erro de CORS e fallback
+app.use((err, req, res, next) => {
+  if (err && err.message === 'Origem não permitida pelo CORS') {
+    return res.status(403).json({ error: 'Origem não permitida' });
+  }
+  return internalError(res, err);
 });
 
 const port = process.env.PORT || process.env.APP_PORT || 3000;
