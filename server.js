@@ -235,17 +235,32 @@ app.get('/api/v1/dashboard/summary', authMiddleware, async (req, res) => {
     const filtroProducts = getTenantFilter(req);
     const filtroCustomers = getTenantFilter(req);
     const filtroUsers = getTenantFilter(req);
+    const filtroTenants = getTenantFilter(req);
 
-    const [products, customers, users] = await Promise.all([
-      pool.query(`SELECT COUNT(*)::int AS total FROM products ${filtroProducts.clause}`, filtroProducts.params),
-      pool.query(`SELECT COUNT(*)::int AS total FROM customers ${filtroCustomers.clause}`, filtroCustomers.params),
-      pool.query(`SELECT COUNT(*)::int AS total FROM users ${filtroUsers.clause}`, filtroUsers.params)
+    const [products, customers, users, credits] = await Promise.all([
+      pool.query(
+        `SELECT COUNT(*)::int AS total FROM products ${filtroProducts.clause}`,
+        filtroProducts.params
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS total FROM customers ${filtroCustomers.clause}`,
+        filtroCustomers.params
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS total FROM users ${filtroUsers.clause}`,
+        filtroUsers.params
+      ),
+      pool.query(
+        `SELECT COALESCE(SUM(total_credito), 0)::numeric AS total FROM tenants ${filtroTenants.clause}`,
+        filtroTenants.params
+      )
     ]);
 
     res.json({
       products: products.rows[0].total,
       customers: customers.rows[0].total,
-      users: users.rows[0].total
+      users: users.rows[0].total,
+      total_credito: Number(credits.rows[0].total || 0)
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -332,12 +347,12 @@ app.post('/api/v1/tenants', authMiddleware, requirePerfil('superadmin', 'admin')
       RETURNING *`,
       [
         nome_fantasia,
-        razao_social,
+        razao_social || nome_fantasia,
         cpf_cnpj || null,
         whatsapp_principal || null,
         email || null,
         plano || 'basico',
-        status_assinatura || 'ativa',
+        status_assinatura || 'ativado',
         Number(total_credito || 0),
         ativo !== false,
         slug
@@ -388,7 +403,7 @@ app.put('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin', 'admi
         whatsapp_principal || null,
         email || null,
         plano || 'basico',
-        status_assinatura || 'ativa',
+        status_assinatura || 'ativado',
         Number(total_credito || 0),
         ativo !== false,
         slug,
@@ -427,7 +442,6 @@ app.delete('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin', 'a
 // ========== CRUD - PRODUCTS ==========
 app.post('/api/v1/products', authMiddleware, async (req, res) => {
   try {
-    const filtro = getTenantFilter(req);
     const tenantId = req.user.perfil === 'superadmin'
       ? (req.body.tenant_id || null)
       : req.user.tenant_id;
