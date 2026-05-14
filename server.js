@@ -336,13 +336,69 @@ app.post('/api/v1/tenants', authMiddleware, requirePerfil('superadmin', 'admin')
         cpf_cnpj || null,
         whatsapp_principal || null,
         email || null,
-        plano || 'pro',
+        plano || 'basico',
         status_assinatura || 'ativa',
         Number(total_credito || 0),
         ativo !== false,
         slug
       ]
     );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin', 'admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      nome_fantasia,
+      razao_social,
+      cpf_cnpj,
+      whatsapp_principal,
+      email,
+      plano,
+      status_assinatura,
+      total_credito,
+      ativo,
+      slug
+    } = req.body;
+
+    const result = await pool.query(
+      `UPDATE tenants
+       SET
+         nome_fantasia = $1,
+         razao_social = $2,
+         cpf_cnpj = $3,
+         whatsapp_principal = $4,
+         email = $5,
+         plano = $6,
+         status_assinatura = $7,
+         total_credito = $8,
+         ativo = $9,
+         slug = $10
+       WHERE id = $11
+       RETURNING *`,
+      [
+        nome_fantasia,
+        razao_social || nome_fantasia,
+        cpf_cnpj || null,
+        whatsapp_principal || null,
+        email || null,
+        plano || 'basico',
+        status_assinatura || 'ativa',
+        Number(total_credito || 0),
+        ativo !== false,
+        slug,
+        id
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Tenant nao encontrado' });
+    }
 
     res.json(result.rows[0]);
   } catch (error) {
