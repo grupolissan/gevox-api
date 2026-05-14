@@ -157,7 +157,20 @@ app.get('/api/v1/tenants', authMiddleware, async (req, res) => {
   try {
     const filtro = getTenantFilter(req);
     const query = `
-      SELECT id, nome_fantasia AS nome, razao_social AS slug, ativo
+      SELECT
+        id,
+        nome_fantasia,
+        razao_social,
+        cpf_cnpj,
+        whatsapp_principal,
+        email,
+        plano,
+        status_assinatura,
+        total_credito,
+        ativo,
+        slug,
+        created_at,
+        updated_at
       FROM tenants
       ${filtro.clause}
       ORDER BY id ASC
@@ -288,86 +301,48 @@ app.get('/customers', authMiddleware, async (req, res) => {
 });
 
 // ========== CRUD - TENANTS ==========
-app.post('/api/v1/tenants', authMiddleware, requirePerfil('superadmin'), async (req, res) => {
+app.post('/api/v1/tenants', authMiddleware, requirePerfil('superadmin', 'admin'), async (req, res) => {
   try {
     const {
       nome_fantasia,
       razao_social,
-      cnpj,
+      cpf_cnpj,
+      whatsapp_principal,
       email,
-      telefone,
       plano,
-      status_assinatura
+      status_assinatura,
+      total_credito,
+      ativo,
+      slug
     } = req.body;
 
     const result = await pool.query(
       `INSERT INTO tenants (
         nome_fantasia,
         razao_social,
-        cnpj,
+        cpf_cnpj,
+        whatsapp_principal,
         email,
-        telefone,
         plano,
-        status_assinatura
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        status_assinatura,
+        total_credito,
+        ativo,
+        slug
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       RETURNING *`,
       [
         nome_fantasia,
         razao_social,
-        cnpj || null,
+        cpf_cnpj || null,
+        whatsapp_principal || null,
         email || null,
-        telefone || null,
-        plano || 'basico',
-        status_assinatura || 'ativa'
-      ]
-    );
-
-    res.json(result.rows[0]);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.put('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin'), async (req, res) => {
-  try {
-    const { id } = req.params;
-    const {
-      nome_fantasia,
-      razao_social,
-      cnpj,
-      email,
-      telefone,
-      plano,
-      status_assinatura
-    } = req.body;
-
-    const result = await pool.query(
-      `UPDATE tenants
-       SET
-         nome_fantasia = $1,
-         razao_social = $2,
-         cnpj = $3,
-         email = $4,
-         telefone = $5,
-         plano = $6,
-         status_assinatura = $7
-       WHERE id = $8
-       RETURNING *`,
-      [
-        nome_fantasia,
-        razao_social,
-        cnpj || null,
-        email || null,
-        telefone || null,
-        plano || 'basico',
+        plano || 'pro',
         status_assinatura || 'ativa',
-        id
+        Number(total_credito || 0),
+        ativo !== false,
+        slug
       ]
     );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Tenant nao encontrado' });
-    }
 
     res.json(result.rows[0]);
   } catch (error) {
@@ -375,7 +350,7 @@ app.put('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin'), asyn
   }
 });
 
-app.delete('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin'), async (req, res) => {
+app.delete('/api/v1/tenants/:id', authMiddleware, requirePerfil('superadmin', 'admin'), async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query(
@@ -598,7 +573,7 @@ app.put('/api/v1/users/:id', authMiddleware, requirePerfil('superadmin', 'admin'
   }
 });
 
-app.delete('/api/v1/users/:id', authMiddleware, requirePerfil('superadmin'), async (req, res) => {
+app.delete('/api/v1/users/:id', authMiddleware, requirePerfil('superadmin', 'admin'), async (req, res) => {
   try {
     const { id } = req.params;
 
